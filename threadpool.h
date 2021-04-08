@@ -3,8 +3,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+// #define _POSIX_C_SOURCE 199309L
+
+#include <errno.h>
+#include <pthread.h>
+#include <stdlib.h>
+#include <time.h>
+
 typedef struct __tpool_future *tpool_future_t;
 typedef struct __threadpool *tpool_t;
+
 
 /**
  * Create a thread pool containing specified number of threads.
@@ -40,10 +48,7 @@ void *tpool_future_get(tpool_future_t future, unsigned int seconds);
  */
 int tpool_future_destroy(tpool_future_t future);
 
-#include <errno.h>
-#include <pthread.h>
-#include <stdlib.h>
-#include <time.h>
+
 
 enum __future_flags {
     __FUTURE_RUNNING = 01,
