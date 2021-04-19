@@ -3,12 +3,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-// #define _POSIX_C_SOURCE 199309L
 
 #include <errno.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <time.h>
+
+
+#define foreach(a, b) \
+    for (int i = a; i < b; i++)
 
 typedef struct __tpool_future *tpool_future_t;
 typedef struct __threadpool *tpool_t;
@@ -39,7 +42,7 @@ int tpool_join(tpool_t pool);
  * NULL is returned. Each tpool_future_get() resets the timeout status on
  * @future.
  */
-void *tpool_future_get(tpool_future_t future, unsigned int seconds);
+void *tpool_future_get(struct __threadpool *tpool, tpool_future_t future, unsigned int seconds);
 
 /**
  * Destroy the future object and free resources once it is no longer used.
@@ -74,6 +77,7 @@ typedef struct __jobqueue {
 struct __tpool_future {
     int flag;
     void *result;
+    pthread_t tid;
     pthread_mutex_t mutex;
     pthread_cond_t cond_finished;
 };
@@ -114,32 +118,7 @@ int tpool_future_destroy(struct __tpool_future *future)
             pthread_mutex_unlock(&future->mutex);
         }
     }
-    return 0;
-}
-
-void *tpool_future_get(struct __tpool_future *future, unsigned int seconds)
-{
-    pthread_mutex_lock(&future->mutex);
-    /* turn off the timeout bit set previously */
-    future->flag &= ~__FUTURE_TIMEOUT;
-    while ((future->flag & __FUTURE_FINISHED) == 0) {
-        if (seconds) {
-            struct timespec expire_time;
-            clock_gettime(CLOCK_MONOTONIC, &expire_time);
-            expire_time.tv_sec += seconds;
-            int status = pthread_cond_timedwait(&future->cond_finished,
-                                                &future->mutex, &expire_time);
-            if (status == ETIMEDOUT) {
-                future->flag |= __FUTURE_TIMEOUT;
-                pthread_mutex_unlock(&future->mutex);
-                return NULL;
-            }
-        } else
-            pthread_cond_wait(&future->cond_finished, &future->mutex);
-    }
-
-    pthread_mutex_unlock(&future->mutex);
-    return future->result;
+    return 0;//note return val
 }
 
 static jobqueue_t *jobqueue_create(void)
@@ -190,11 +169,12 @@ static void *jobqueue_fetch(void *queue)
     int old_state;
 
     pthread_cleanup_push(__jobqueue_fetch_cleanup, (void *) &jobqueue->rwlock);
-
+    
     while (1) {
         pthread_mutex_lock(&jobqueue->rwlock);
         pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, &old_state);
-        pthread_testcancel();
+        pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, &old_state); //add
+        pthread_testcancel(); // produce cancellation point
 
         while (!jobqueue->tail) 
 			pthread_cond_wait(&jobqueue->cond_nonempty, &jobqueue->rwlock);
@@ -204,6 +184,7 @@ static void *jobqueue_fetch(void *queue)
             jobqueue->head = jobqueue->tail = NULL;
         } else {
             threadtask_t *tmp;
+            // add
             for (tmp = jobqueue->head; tmp->next != jobqueue->tail;
                  tmp = tmp->next)
                 ;
@@ -211,10 +192,13 @@ static void *jobqueue_fetch(void *queue)
             tmp->next = NULL;
             jobqueue->tail = tmp;
         }
+
         pthread_mutex_unlock(&jobqueue->rwlock);
+
 
         if (task->func) {
             pthread_mutex_lock(&task->future->mutex);
+            task->future->tid = pthread_self();
             if (task->future->flag & __FUTURE_CANCELLED) {
                 pthread_mutex_unlock(&task->future->mutex);
                 free(task);
@@ -224,7 +208,14 @@ static void *jobqueue_fetch(void *queue)
                 pthread_mutex_unlock(&task->future->mutex);
             }
 
-            void *ret_value = task->func(task->arg);
+            // add
+            pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, &old_state);
+            pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, &old_state);
+            void *ret_value = task->func(task->arg);//note set cancellable
+            pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &old_state);
+            //////////////
+            
+            
             pthread_mutex_lock(&task->future->mutex);
             if (task->future->flag & __FUTURE_DESTROYED) {
                 pthread_mutex_unlock(&task->future->mutex);
@@ -276,6 +267,7 @@ struct __threadpool *tpool_create(size_t count)
                 free(pool);
                 return NULL;
             }
+            printf("workers[%d] = %ld\n", i, pool->workers[i]);
         }
         return pool;
     }
@@ -311,6 +303,52 @@ struct __tpool_future *tpool_apply(struct __threadpool *pool,
         return NULL;
     }
     return future;
+}
+
+
+void *tpool_future_get(struct __threadpool *tpool, struct __tpool_future *future, unsigned int seconds)
+{
+    pthread_mutex_lock(&future->mutex);
+    /* turn off the timeout bit set previously */
+    future->flag &= ~__FUTURE_TIMEOUT;
+    while ((future->flag & __FUTURE_FINISHED) == 0) {
+        if (seconds) {
+            struct timespec expire_time;
+            clock_gettime(CLOCK_MONOTONIC, &expire_time);
+            expire_time.tv_sec += seconds;
+            int status = pthread_cond_timedwait(&future->cond_finished,
+                                                &future->mutex, &expire_time);
+            if (status == ETIMEDOUT) {
+                printf("Timeout in pid = %ld\n", future->tid);
+                future->flag |= __FUTURE_TIMEOUT;
+                pthread_mutex_unlock(&future->mutex);
+
+                // add : cancellation handle
+                pthread_t tid = future->tid;
+                int cancel_status = pthread_cancel(tid);
+                if (cancel_status != ESRCH) { // No thread with the ID thread could be found.
+                    pthread_join(tid, NULL);
+                    for (int i = 0; i < tpool->count; i++) {
+                        if (tpool->workers[i] == tid) {
+                            printf("workers[%d] = %ld is found, recreate\n", i, tid);
+                            if (pthread_create(&tpool->workers[i], NULL, jobqueue_fetch,
+                               (void *) tpool->jobqueue)) {
+                                   printf("recreate failed \n");
+                            }
+                            break;
+                        }
+                    }
+                }
+                //note pthread cancel and create
+                return NULL;
+            }
+        } else
+            pthread_cond_wait(&future->cond_finished, &future->mutex);
+    }
+
+    pthread_mutex_unlock(&future->mutex);
+    printf("thread tid = %ld is successful\n", future->tid);
+    return future->result;
 }
 
 int tpool_join(struct __threadpool *pool)
